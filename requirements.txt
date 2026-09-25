@@ -12,3 +12,4 @@ tensorboard
 scipy
 scikit-learn
 scikit-image
+flask
