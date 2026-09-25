@@ -1,15 +1,18 @@
 import os
 import sys
 import time
+import json
 import uuid
+import queue
+import threading
+import subprocess
 import torch
 import cv2
 import numpy as np
 from PIL import Image
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
+from flask import Flask, request, jsonify, render_template_string, send_from_directory, Response
 from torchvision.transforms import Compose, Normalize, ToTensor
 
-# Ensure HiGAN+ is in path
 repo_root = os.path.dirname(os.path.abspath(__file__))
 higan_dir = os.path.join(repo_root, "HiGAN+")
 if higan_dir not in sys.path:
@@ -19,25 +22,33 @@ from lib.utils import yaml2config
 from lib.alphabet import strLabelConverter
 from networks import get_model
 from networks.utils import rescale_images2
+from prepare_dataset import clean_and_segment_page
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = os.path.join(repo_root, "uploads")
 app.config['OUTPUT_FOLDER'] = os.path.join(repo_root, "output")
+app.config['CUSTOM_DATA_FOLDER'] = os.path.join(repo_root, "data/my_handwriting")
+app.config['CROPS_TEMP_FOLDER'] = os.path.join(repo_root, "uploads/crops_temp")
+
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+os.makedirs(app.config['CUSTOM_DATA_FOLDER'], exist_ok=True)
+os.makedirs(app.config['CROPS_TEMP_FOLDER'], exist_ok=True)
 
-# Global model state
 MODEL = None
 CFG = None
 DEVICE = None
 LABEL_CONVERTER = None
 ORG_TRANSFORMS = None
 
-def init_model(device_str="auto"):
-    global MODEL, CFG, DEVICE, LABEL_CONVERTER, ORG_TRANSFORMS
-    if MODEL is not None:
-        return
+# Training state
+TRAIN_THREAD = None
+TRAIN_PROC = None
+TRAIN_LOGS = []
+IS_TRAINING = False
 
+def init_model(device_str="auto", ckpt_override=None):
+    global MODEL, CFG, DEVICE, LABEL_CONVERTER, ORG_TRANSFORMS
     if device_str == "auto":
         DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     else:
@@ -46,12 +57,12 @@ def init_model(device_str="auto"):
     prev_cwd = os.getcwd()
     os.chdir(higan_dir)
     config_path = "configs/gan_image.yml"
-    ckpt_path = "pretrained/deploy_HiGAN+.pth"
+    ckpt_path = ckpt_override or "pretrained/deploy_HiGAN+.pth"
 
     CFG = yaml2config(config_path)
     CFG.device = str(DEVICE)
 
-    print(f"Loading HiGAN+ model onto {DEVICE}...")
+    print(f"Loading HiGAN+ model onto {DEVICE} from {ckpt_path}...")
     MODEL = get_model(CFG.model)(CFG, config_path)
     MODEL.load(ckpt_path, DEVICE)
     MODEL.set_mode('eval')
@@ -59,7 +70,7 @@ def init_model(device_str="auto"):
 
     LABEL_CONVERTER = strLabelConverter('all')
     ORG_TRANSFORMS = Compose([ToTensor(), Normalize([0.5], [0.5])])
-    print("HiGAN+ model initialized and ready!")
+    print("HiGAN+ model loaded.")
 
 def render_handwriting(text: str, style_image_path: str, output_path: str):
     ref_cv = cv2.imread(style_image_path, cv2.IMREAD_GRAYSCALE)
@@ -149,313 +160,256 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>HiGAN+ Handwriting Synthesizer</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HiGAN+ Handwriting & Fine-Tuning</title>
   <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --success: #10b981;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.5;
-      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      max-width: 960px;
+      margin: 20px auto;
+      padding: 0 16px;
+      color: #111;
+      background: #fafafa;
+      line-height: 1.4;
     }
-    .container {
-      max-width: 1100px;
-      margin: 0 auto;
-    }
-    header {
-      margin-bottom: 24px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 16px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-    }
-    h1 { font-size: 1.6rem; font-weight: 700; color: #60a5fa; }
-    .badge {
-      font-size: 0.8rem;
-      background: #1e3a8a;
-      color: #93c5fd;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-weight: 600;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 24px;
-      margin-bottom: 32px;
-    }
-    @media (max-width: 768px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 20px;
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
-    }
-    h2 { font-size: 1.15rem; font-weight: 600; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
-    label { display: block; font-size: 0.9rem; font-weight: 500; margin-bottom: 6px; color: var(--text-muted); }
-    textarea, select, input[type="text"] {
-      width: 100%;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      color: var(--text);
-      border-radius: 8px;
-      padding: 10px 14px;
-      font-size: 0.95rem;
-      font-family: inherit;
-      resize: vertical;
-      margin-bottom: 16px;
-    }
-    textarea:focus, select:focus, input:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    .style-picker {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-      gap: 10px;
-      margin-bottom: 16px;
-      max-height: 200px;
-      overflow-y: auto;
-      padding: 4px;
-    }
-    .style-card {
-      border: 2px solid var(--border);
-      border-radius: 8px;
-      padding: 8px;
-      cursor: pointer;
-      text-align: center;
-      transition: all 0.15s ease;
-      background: #0f172a;
-    }
-    .style-card:hover { border-color: var(--accent); }
-    .style-card.active { border-color: var(--accent); background: #1e3a8a33; }
-    .style-card img { max-width: 100%; height: 32px; object-fit: contain; filter: invert(1); margin-bottom: 4px; }
-    .style-card .name { font-size: 0.75rem; color: var(--text-muted); word-break: break-all; }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 100%;
-      padding: 12px;
-      background: var(--accent);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.15s;
-    }
-    .btn:hover { background: var(--accent-hover); }
-    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-    .preview-box {
-      min-height: 220px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      background: #0f172a;
-      border: 1px dashed var(--border);
-      border-radius: 8px;
+    h1 { margin-bottom: 4px; font-size: 1.5rem; }
+    p.sub { color: #666; margin-top: 0; margin-bottom: 20px; font-size: 0.9rem; }
+    fieldset {
+      background: #fff;
+      border: 1px solid #ccc;
       padding: 16px;
-      overflow-x: auto;
+      margin-bottom: 20px;
     }
-    .preview-box img {
+    legend {
+      font-weight: bold;
+      padding: 0 6px;
+      font-size: 1rem;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-top: 10px;
+      margin-bottom: 4px;
+      font-size: 0.85rem;
+    }
+    textarea, select, input[type="text"], input[type="number"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      border: 1px solid #ccc;
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+    button {
+      padding: 8px 16px;
+      background: #eee;
+      border: 1px solid #999;
+      cursor: pointer;
+      font-weight: 600;
+      margin-top: 10px;
+    }
+    button:hover { background: #ddd; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    pre {
+      background: #222;
+      color: #0f0;
+      padding: 12px;
+      border: 1px solid #444;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      max-height: 250px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .preview-img {
       max-width: 100%;
       height: auto;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+      display: block;
       background: white;
-      border-radius: 4px;
-      box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
-    .preview-actions {
-      margin-top: 12px;
+    .crop-grid {
       display: flex;
-      gap: 12px;
-      width: 100%;
-    }
-    .btn-secondary {
-      background: #334155;
-      padding: 8px 16px;
-      border-radius: 6px;
-      color: white;
-      text-decoration: none;
-      font-size: 0.85rem;
-      font-weight: 500;
-      text-align: center;
-    }
-    .btn-secondary:hover { background: #475569; }
-    .gallery-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 16px;
-    }
-    .gallery-item {
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-    }
-    .gallery-item img {
-      width: 100%;
-      height: 100px;
-      object-fit: contain;
-      background: white;
-      border-radius: 4px;
-      margin-bottom: 8px;
-    }
-    .gallery-meta {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 0.8rem;
-      color: var(--text-muted);
-    }
-    .file-input-wrapper {
-      margin-bottom: 16px;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+      max-height: 320px;
+      overflow-y: auto;
+      border: 1px solid #ddd;
       padding: 10px;
-      border: 1px dashed var(--border);
-      border-radius: 8px;
-      background: #0f172a;
-      text-align: center;
+      background: #fdfdfd;
     }
-    .file-input-wrapper input { display: none; }
-    .file-input-label {
-      cursor: pointer;
-      color: var(--accent);
+    .crop-item {
+      border: 1px solid #ccc;
+      padding: 6px;
+      width: 140px;
+      text-align: center;
+      background: white;
+    }
+    .crop-item img {
+      max-width: 100%;
+      height: 40px;
+      object-fit: contain;
+      border: 1px solid #eee;
+    }
+    .crop-item input {
+      width: 100%;
+      font-size: 11px;
+      padding: 3px;
+      margin-top: 4px;
+      box-sizing: border-box;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
       font-size: 0.85rem;
-      font-weight: 500;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 6px 10px;
+      text-align: left;
+    }
+    th { background: #f2f2f2; }
+    .status-tag {
+      display: inline-block;
+      padding: 2px 6px;
+      background: #e2e8f0;
+      font-size: 0.75rem;
+      font-weight: bold;
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <div>
-        <h1>HiGAN+ Handwriting Synthesizer</h1>
-        <p style="color: var(--text-muted); font-size: 0.85rem;">Synthesize realistic handwritten assignments from text</p>
-      </div>
-      <div>
-        <span class="badge">Running on {{ device }}</span>
-      </div>
-    </header>
 
-    <div class="grid">
-      <!-- Input Controls -->
-      <div class="card">
-        <h2>1. Synthesis Prompt & Style</h2>
-        <form id="synthForm">
-          <label for="textInput">Text to Write (supports multi-line):</label>
-          <textarea id="textInput" rows="5" placeholder="Enter assignment text here...&#10;e.g.&#10;Assignment 1: Neural Networks&#10;Question 1: What is backpropagation?">Assignment 1: Artificial Intelligence&#10;Submitted by: Hari Narayan&#10;Question 1: Explain generative adversarial networks.</textarea>
+  <h1>HiGAN+ Handwriting Synthesizer</h1>
+  <p class="sub">Local Device: <strong>{{ device }}</strong> | Mode: Evaluation & Fine-Tuning</p>
 
-          <label>Select Reference Handwriting Style:</label>
-          <div class="style-picker" id="stylePicker">
-            {% for sample in samples %}
-            <div class="style-card {% if sample.name == 'preparation' %}active{% endif %}" data-style="{{ sample.name }}">
-              <img src="/data/image_samples/{{ sample.filename }}" alt="{{ sample.name }}">
-              <div class="name">{{ sample.name }}</div>
-            </div>
-            {% endfor %}
-          </div>
-          <input type="hidden" id="selectedStyle" value="preparation">
+  <!-- SECTION 1: SYNTHESIS -->
+  <fieldset>
+    <legend>1. Write / Synthesize Handwriting</legend>
+    <form id="synthForm">
+      <label for="synthText">Text to write (supports multiple lines):</label>
+      <textarea id="synthText" rows="4">Assignment 1: Artificial Intelligence&#10;Submitted by: Hari Narayan&#10;Question 1: Explain generative adversarial networks.</textarea>
 
-          <label>Or Upload Your Own Handwriting Photo:</label>
-          <div class="file-input-wrapper">
-            <label class="file-input-label" for="customImageInput">📁 Click to choose an image of your handwriting</label>
-            <input type="file" id="customImageInput" accept="image/*">
-            <div id="fileNameDisplay" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;"></div>
-          </div>
-
-          <button type="submit" class="btn" id="generateBtn">✍️ Generate Handwriting</button>
-        </form>
-      </div>
-
-      <!-- Live Preview -->
-      <div class="card">
-        <h2>2. Live Preview</h2>
-        <div class="preview-box" id="previewBox">
-          <img id="previewImage" src="/output/assignment_demo.png" alt="Generated Handwriting Preview" onerror="this.style.display='none'">
-          <p id="placeholderText" style="display: none; color: var(--text-muted);">Click "Generate Handwriting" to render</p>
+      <div style="display: flex; gap: 20px; margin-top: 10px;">
+        <div style="flex: 1;">
+          <label for="synthStyle">Reference Style:</label>
+          <select id="synthStyle">
+            <optgroup label="Custom Handwriting">
+              <option value="__custom_folder__">Latest Fine-Tuned / Custom Sample</option>
+            </optgroup>
+            <optgroup label="Built-in IAM Styles">
+              {% for s in samples %}
+              <option value="{{ s.name }}" {% if s.name == 'preparation' %}selected{% endif %}>{{ s.name }}</option>
+              {% endfor %}
+            </optgroup>
+          </select>
         </div>
-        <div class="preview-actions" id="previewActions">
-          <a id="downloadBtn" href="/output/assignment_demo.png" download="handwritten_assignment.png" class="btn-secondary" style="flex: 1;">⬇️ Download Full Image</a>
-          <a id="openTabBtn" href="/output/assignment_demo.png" target="_blank" class="btn-secondary">🔗 Open in New Tab</a>
+        <div style="flex: 1;">
+          <label for="singleWordUpload">Or upload 1 reference word image:</label>
+          <input type="file" id="singleWordUpload" accept="image/*">
         </div>
+      </div>
+
+      <button type="submit" id="synthBtn">Generate Handwriting</button>
+    </form>
+
+    <div id="previewArea" style="margin-top: 15px; display: none;">
+      <strong>Generated Output:</strong>
+      <img id="previewImg" class="preview-img" src="" alt="Handwriting Output">
+      <div style="margin-top: 8px;">
+        <a id="downloadLink" href="" download="handwriting.png"><button type="button">Download Image</button></a>
+        <a id="tabLink" href="" target="_blank"><button type="button">Open in New Tab</button></a>
+      </div>
+    </div>
+  </fieldset>
+
+  <!-- SECTION 2: FINE-TUNING PIPELINE -->
+  <fieldset>
+    <legend>2. Fine-Tune on Your Own Handwriting</legend>
+
+    <p style="font-size: 0.85rem; color: #444;">
+      Upload a photo/scan of an A4 page with your handwriting. The system cleans shadows, cuts out each word, and lets you verify labels before training.
+    </p>
+
+    <!-- Step A: Upload & Segment -->
+    <div style="background: #f9f9f9; padding: 12px; border: 1px solid #ddd; margin-bottom: 15px;">
+      <strong>Step A: Segment Words from Page Photo</strong>
+      <div style="margin-top: 8px;">
+        <input type="file" id="pagePhotoInput" accept="image/*">
+        <button type="button" id="segmentBtn">Extract & Auto-Crop Words</button>
+      </div>
+
+      <div id="cropsContainer" style="display: none; margin-top: 12px;">
+        <p style="font-size: 0.8rem; color: #555; margin-bottom: 4px;">
+          Extracted words detected below. Edit the label under each word if needed, then click "Save to Dataset":
+        </p>
+        <div class="crop-grid" id="cropGrid"></div>
+        <button type="button" id="saveDatasetBtn" style="margin-top: 10px; background: #dbeafe; border-color: #93c5fd;">
+          Save Labeled Words into Dataset
+        </button>
+        <span id="saveStatus" style="font-size: 0.85rem; margin-left: 10px; font-weight: bold;"></span>
       </div>
     </div>
 
-    <!-- Gallery of Generated Files -->
-    <div class="card">
-      <h2>3. Previously Generated Assignments & Demos</h2>
-      <div class="gallery-grid" id="galleryGrid">
-        {% for item in gallery %}
-        <div class="gallery-item">
-          <a href="/output/{{ item.filename }}" target="_blank">
-            <img src="/output/{{ item.filename }}" alt="{{ item.filename }}">
-          </a>
-          <div class="gallery-meta">
-            <span>{{ item.filename }}</span>
-            <a href="/output/{{ item.filename }}" download style="color: var(--accent); text-decoration: none;">⬇️ Save</a>
-          </div>
+    <!-- Step B: Run Training with Live Output -->
+    <div style="background: #f9f9f9; padding: 12px; border: 1px solid #ddd;">
+      <strong>Step B: Run Fine-Tuning</strong>
+      <div style="display: flex; gap: 15px; align-items: flex-end; margin-top: 8px;">
+        <div style="width: 120px;">
+          <label for="epochsInput" style="margin-top:0;">Epochs:</label>
+          <input type="number" id="epochsInput" value="30" min="5" max="200">
         </div>
+        <div>
+          <button type="button" id="startTrainBtn" style="background: #e0f2fe; border-color: #38bdf8;">
+            Start Fine-Tuning
+          </button>
+          <button type="button" id="stopTrainBtn" disabled>Stop Training</button>
+        </div>
+      </div>
+
+      <label style="margin-top: 12px;">Real-Time Training Output & Debug Logs:</label>
+      <pre id="trainLogs">Waiting to start fine-tuning...</pre>
+    </div>
+  </fieldset>
+
+  <!-- SECTION 3: GENERATED FILES -->
+  <fieldset>
+    <legend>3. Previously Generated Files</legend>
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 140px;">Preview</th>
+          <th>Filename</th>
+          <th style="width: 100px;">Action</th>
+        </tr>
+      </thead>
+      <tbody id="galleryTable">
+        {% for g in gallery %}
+        <tr>
+          <td><img src="/output/{{ g.filename }}" style="height: 35px; max-width: 120px; object-fit: contain; background: white; border: 1px solid #ccc;"></td>
+          <td>{{ g.filename }}</td>
+          <td><a href="/output/{{ g.filename }}" download><button type="button" style="margin: 0; padding: 4px 8px; font-size: 11px;">Download</button></a></td>
+        </tr>
         {% endfor %}
-      </div>
-    </div>
-  </div>
+      </tbody>
+    </table>
+  </fieldset>
 
   <script>
-    // Style selection handler
-    document.querySelectorAll('.style-card').forEach(card => {
-      card.addEventListener('click', () => {
-        document.querySelectorAll('.style-card').forEach(c => c.classList.remove('active'));
-        card.classList.add('active');
-        document.getElementById('selectedStyle').value = card.dataset.style;
-        // Clear file input if built-in style chosen
-        document.getElementById('customImageInput').value = '';
-        document.getElementById('fileNameDisplay').textContent = '';
-      });
-    });
-
-    // Custom file input handler
-    document.getElementById('customImageInput').addEventListener('change', (e) => {
-      if (e.target.files.length > 0) {
-        document.getElementById('fileNameDisplay').textContent = 'Selected: ' + e.target.files[0].name;
-        document.querySelectorAll('.style-card').forEach(c => c.classList.remove('active'));
-      }
-    });
-
-    // Form submit
+    // SYNTHESIS FORM
     document.getElementById('synthForm').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const btn = document.getElementById('generateBtn');
-      const text = document.getElementById('textInput').value.trim();
-      const style = document.getElementById('selectedStyle').value;
-      const fileInput = document.getElementById('customImageInput');
+      const btn = document.getElementById('synthBtn');
+      const text = document.getElementById('synthText').value.trim();
+      const style = document.getElementById('synthStyle').value;
+      const fileInput = document.getElementById('singleWordUpload');
 
-      if (!text) {
-        alert('Please enter some text to write.');
-        return;
-      }
-
+      if (!text) { alert('Please enter some text.'); return; }
       btn.disabled = true;
-      btn.textContent = '⏳ Rendering Handwriting...';
+      btn.textContent = 'Generating...';
 
       const formData = new FormData();
       formData.append('text', text);
@@ -465,34 +419,26 @@ HTML_TEMPLATE = """
       }
 
       try {
-        const resp = await fetch('/api/generate', {
-          method: 'POST',
-          body: formData
-        });
+        const resp = await fetch('/api/generate', { method: 'POST', body: formData });
         const data = await resp.json();
         if (data.success) {
-          const previewImg = document.getElementById('previewImage');
-          const cacheBuster = '?t=' + new Date().getTime();
-          previewImg.src = data.url + cacheBuster;
-          previewImg.style.display = 'block';
-          document.getElementById('placeholderText').style.display = 'none';
-          document.getElementById('downloadBtn').href = data.url;
-          document.getElementById('openTabBtn').href = data.url;
+          const previewArea = document.getElementById('previewArea');
+          const previewImg = document.getElementById('previewImg');
+          const cacheBust = '?t=' + Date.now();
+          previewImg.src = data.url + cacheBust;
+          document.getElementById('downloadLink').href = data.url;
+          document.getElementById('tabLink').href = data.url;
+          previewArea.style.display = 'block';
 
-          // Prepend to gallery
-          const gallery = document.getElementById('galleryGrid');
-          const newItem = document.createElement('div');
-          newItem.className = 'gallery-item';
-          newItem.innerHTML = `
-            <a href="${data.url}" target="_blank">
-              <img src="${data.url + cacheBuster}" alt="${data.filename}">
-            </a>
-            <div class="gallery-meta">
-              <span>${data.filename}</span>
-              <a href="${data.url}" download style="color: var(--accent); text-decoration: none;">⬇️ Save</a>
-            </div>
+          // Add to table
+          const tbody = document.getElementById('galleryTable');
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td><img src="${data.url + cacheBust}" style="height: 35px; max-width: 120px; object-fit: contain; background: white; border: 1px solid #ccc;"></td>
+            <td>${data.filename}</td>
+            <td><a href="${data.url}" download><button type="button" style="margin: 0; padding: 4px 8px; font-size: 11px;">Download</button></a></td>
           `;
-          gallery.insertBefore(newItem, gallery.firstChild);
+          tbody.insertBefore(tr, tbody.firstChild);
         } else {
           alert('Error: ' + data.error);
         }
@@ -500,8 +446,147 @@ HTML_TEMPLATE = """
         alert('Request failed: ' + err);
       } finally {
         btn.disabled = false;
-        btn.textContent = '✍️ Generate Handwriting';
+        btn.textContent = 'Generate Handwriting';
       }
+    });
+
+    // SEGMENT A4 PAGE
+    document.getElementById('segmentBtn').addEventListener('click', async () => {
+      const fileInput = document.getElementById('pagePhotoInput');
+      if (!fileInput.files.length) {
+        alert('Please choose a photo of your handwriting first.');
+        return;
+      }
+      const btn = document.getElementById('segmentBtn');
+      btn.disabled = true;
+      btn.textContent = 'Cleaning & Segmenting Words...';
+
+      const formData = new FormData();
+      formData.append('page_image', fileInput.files[0]);
+
+      try {
+        const resp = await fetch('/api/dataset/segment', { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (data.success) {
+          const container = document.getElementById('cropsContainer');
+          const grid = document.getElementById('cropGrid');
+          grid.innerHTML = '';
+          data.crops.forEach((crop, idx) => {
+            const div = document.createElement('div');
+            div.className = 'crop-item';
+            div.innerHTML = `
+              <img src="/uploads/crops_temp/${crop.filename}?t=${Date.now()}">
+              <input type="text" data-file="${crop.filename}" value="${crop.suggested_label}" placeholder="word label">
+            `;
+            grid.appendChild(div);
+          });
+          container.style.display = 'block';
+        } else {
+          alert('Segmentation error: ' + data.error);
+        }
+      } catch (err) {
+        alert('Request failed: ' + err);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Extract & Auto-Crop Words';
+      }
+    });
+
+    // SAVE DATASET LABELS
+    document.getElementById('saveDatasetBtn').addEventListener('click', async () => {
+      const inputs = document.querySelectorAll('#cropGrid input');
+      const items = [];
+      inputs.forEach(inp => {
+        const val = inp.value.trim();
+        if (val) {
+          items.push({ filename: inp.dataset.file, label: val });
+        }
+      });
+
+      if (!items.length) {
+        alert('No labeled items to save.');
+        return;
+      }
+
+      const status = document.getElementById('saveStatus');
+      status.textContent = 'Saving dataset...';
+
+      try {
+        const resp = await fetch('/api/dataset/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items })
+        });
+        const data = await resp.json();
+        if (data.success) {
+          status.textContent = `Saved ${data.count} word images to data/my_handwriting!`;
+          status.style.color = 'green';
+        } else {
+          status.textContent = 'Error: ' + data.error;
+          status.style.color = 'red';
+        }
+      } catch (err) {
+        status.textContent = 'Save failed: ' + err;
+        status.style.color = 'red';
+      }
+    });
+
+    // FINE-TUNING STREAM & CONTROL
+    let logEventSource = null;
+
+    document.getElementById('startTrainBtn').addEventListener('click', async () => {
+      const epochs = document.getElementById('epochsInput').value;
+      const btn = document.getElementById('startTrainBtn');
+      const stopBtn = document.getElementById('stopTrainBtn');
+      const logsPre = document.getElementById('trainLogs');
+
+      btn.disabled = true;
+      stopBtn.disabled = false;
+      logsPre.textContent = 'Initializing fine-tuning process...\\n';
+
+      try {
+        const resp = await fetch('/api/finetune/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ epochs: parseInt(epochs) })
+        });
+        const data = await resp.json();
+        if (!data.success) {
+          alert('Could not start training: ' + data.error);
+          btn.disabled = false;
+          stopBtn.disabled = true;
+          return;
+        }
+
+        // Connect SSE stream
+        if (logEventSource) logEventSource.close();
+        logEventSource = new EventSource('/api/finetune/stream');
+
+        logEventSource.onmessage = (e) => {
+          logsPre.textContent += e.data + '\\n';
+          logsPre.scrollTop = logsPre.scrollHeight;
+          if (e.data.includes('TRAINING_COMPLETE') || e.data.includes('TRAINING_STOPPED')) {
+            btn.disabled = false;
+            stopBtn.disabled = true;
+            logEventSource.close();
+          }
+        };
+
+        logEventSource.onerror = () => {
+          // SSE closed or finished
+        };
+
+      } catch (err) {
+        alert('Start training request failed: ' + err);
+        btn.disabled = false;
+        stopBtn.disabled = true;
+      }
+    });
+
+    document.getElementById('stopTrainBtn').addEventListener('click', async () => {
+      await fetch('/api/finetune/stop', { method: 'POST' });
+      document.getElementById('stopTrainBtn').disabled = true;
+      document.getElementById('startTrainBtn').disabled = false;
     });
   </script>
 </body>
@@ -514,19 +599,17 @@ def index():
     sample_files = sorted([f for f in os.listdir(samples_dir) if f.endswith('.png')])
     samples = [{"name": os.path.splitext(f)[0], "filename": f} for f in sample_files]
 
-    # Load gallery
     out_files = []
     if os.path.exists(app.config['OUTPUT_FOLDER']):
         files = [f for f in os.listdir(app.config['OUTPUT_FOLDER']) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        # Sort by mtime descending
         files.sort(key=lambda x: os.path.getmtime(os.path.join(app.config['OUTPUT_FOLDER'], x)), reverse=True)
         out_files = [{"filename": f} for f in files]
 
     return render_template_string(HTML_TEMPLATE, samples=samples, gallery=out_files, device=str(DEVICE))
 
-@app.route('/data/image_samples/<filename>')
-def serve_sample(filename):
-    return send_from_directory(os.path.join(higan_dir, "data/image_samples"), filename)
+@app.route('/uploads/crops_temp/<filename>')
+def serve_crop(filename):
+    return send_from_directory(app.config['CROPS_TEMP_FOLDER'], filename)
 
 @app.route('/output/<filename>')
 def serve_output(filename):
@@ -540,15 +623,19 @@ def api_generate():
     if not text:
         return jsonify({"success": False, "error": "No text provided"}), 400
 
-    # Check if custom image uploaded
     if 'custom_file' in request.files and request.files['custom_file'].filename:
         uploaded_file = request.files['custom_file']
         ext = os.path.splitext(uploaded_file.filename)[1] or '.png'
         custom_fn = f"upload_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
         style_path = os.path.join(app.config['UPLOAD_FOLDER'], custom_fn)
         uploaded_file.save(style_path)
+    elif style == "__custom_folder__":
+        # Use first image in data/my_handwriting
+        custom_files = [f for f in os.listdir(app.config['CUSTOM_DATA_FOLDER']) if f.endswith(('.png', '.jpg'))]
+        if not custom_files:
+            return jsonify({"success": False, "error": "No images found in data/my_handwriting. Please upload/segment samples first."}), 400
+        style_path = os.path.join(app.config['CUSTOM_DATA_FOLDER'], custom_files[0])
     else:
-        # built in sample
         sample_candidate = os.path.join(higan_dir, "data/image_samples", style + ".png")
         if os.path.exists(sample_candidate):
             style_path = sample_candidate
@@ -568,6 +655,149 @@ def api_generate():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route('/api/dataset/segment', methods=['POST'])
+def api_segment():
+    if 'page_image' not in request.files or not request.files['page_image'].filename:
+        return jsonify({"success": False, "error": "No page image uploaded"}), 400
+
+    uploaded_file = request.files['page_image']
+    ext = os.path.splitext(uploaded_file.filename)[1] or '.png'
+    temp_page_path = os.path.join(app.config['UPLOAD_FOLDER'], f"page_{int(time.time())}{ext}")
+    uploaded_file.save(temp_page_path)
+
+    try:
+        crops = clean_and_segment_page(temp_page_path, app.config['CROPS_TEMP_FOLDER'])
+        crop_items = []
+        for fp in crops:
+            fn = os.path.basename(fp)
+            crop_items.append({"filename": fn, "suggested_label": ""})
+
+        return jsonify({"success": True, "crops": crop_items})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/dataset/save', methods=['POST'])
+def api_save_dataset():
+    data = request.json or {}
+    items = data.get('items', [])
+    if not items:
+        return jsonify({"success": False, "error": "No items provided"}), 400
+
+    count = 0
+    for it in items:
+        fn = it.get('filename')
+        label = it.get('label', '').strip()
+        if not fn or not label:
+            continue
+        src = os.path.join(app.config['CROPS_TEMP_FOLDER'], fn)
+        if os.path.exists(src):
+            # Clean label
+            clean_label = "".join([c for c in label if c.isalnum() or c in ['-', '_']])
+            dst_fn = f"{clean_label}.png"
+            dst_fp = os.path.join(app.config['CUSTOM_DATA_FOLDER'], dst_fn)
+            # If exists, add index
+            i = 1
+            while os.path.exists(dst_fp):
+                dst_fn = f"{clean_label}_{i}.png"
+                dst_fp = os.path.join(app.config['CUSTOM_DATA_FOLDER'], dst_fn)
+                i += 1
+            # Copy file
+            img = cv2.imread(src)
+            cv2.imwrite(dst_fp, img)
+            count += 1
+
+    return jsonify({"success": True, "count": count})
+
+def train_worker(epochs):
+    global IS_TRAINING, TRAIN_PROC
+    IS_TRAINING = True
+    TRAIN_LOGS.clear()
+    TRAIN_LOGS.append(f"Starting fine-tuning for {epochs} epochs...")
+
+    prev_cwd = os.getcwd()
+    os.chdir(higan_dir)
+
+    # Update epochs in finetune_custom.yml if needed
+    cmd = [
+        os.path.join(repo_root, ".venv/bin/python"),
+        "train.py",
+        "--config", "./configs/finetune_custom.yml"
+    ]
+
+    try:
+        TRAIN_PROC = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        for line in iter(TRAIN_PROC.stdout.readline, ''):
+            if not line:
+                break
+            line_str = line.strip()
+            TRAIN_LOGS.append(line_str)
+            print(f"[TRAIN] {line_str}")
+
+        TRAIN_PROC.stdout.close()
+        return_code = TRAIN_PROC.wait()
+        if return_code == 0:
+            TRAIN_LOGS.append(">>> TRAINING_COMPLETE: Model successfully fine-tuned!")
+        else:
+            TRAIN_LOGS.append(f">>> TRAINING_FAILED: Process exited with code {return_code}")
+    except Exception as e:
+        TRAIN_LOGS.append(f">>> ERROR: {str(e)}")
+    finally:
+        os.chdir(prev_cwd)
+        IS_TRAINING = False
+
+@app.route('/api/finetune/start', methods=['POST'])
+def api_start_train():
+    global TRAIN_THREAD, IS_TRAINING
+    if IS_TRAINING:
+        return jsonify({"success": False, "error": "Training is already running"}), 400
+
+    data = request.json or {}
+    epochs = data.get('epochs', 30)
+
+    # Check if custom data exists
+    custom_files = [f for f in os.listdir(app.config['CUSTOM_DATA_FOLDER']) if f.endswith('.png')]
+    if not custom_files:
+        return jsonify({"success": False, "error": "No training images found in data/my_handwriting. Please extract/save words first!"}), 400
+
+    TRAIN_THREAD = threading.Thread(target=train_worker, args=(epochs,))
+    TRAIN_THREAD.daemon = True
+    TRAIN_THREAD.start()
+
+    return jsonify({"success": True})
+
+@app.route('/api/finetune/stop', methods=['POST'])
+def api_stop_train():
+    global TRAIN_PROC, IS_TRAINING
+    if TRAIN_PROC and IS_TRAINING:
+        TRAIN_PROC.terminate()
+        IS_TRAINING = False
+        TRAIN_LOGS.append(">>> TRAINING_STOPPED by user.")
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "No training in progress"})
+
+@app.route('/api/finetune/stream')
+def api_stream_logs():
+    def event_stream():
+        last_idx = 0
+        while True:
+            if last_idx < len(TRAIN_LOGS):
+                while last_idx < len(TRAIN_LOGS):
+                    msg = TRAIN_LOGS[last_idx]
+                    last_idx += 1
+                    yield f"data: {msg}\n\n"
+            else:
+                if not IS_TRAINING and last_idx >= len(TRAIN_LOGS):
+                    break
+                time.sleep(0.5)
+    return Response(event_stream(), mimetype="text/event-stream")
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -577,5 +807,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     init_model(args.device)
-    print(f"\n🚀 HiGAN+ Web UI starting at http://{args.host}:{args.port}")
+    print(f"\n🚀 HiGAN+ Simple Web UI started at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False)

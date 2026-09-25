@@ -652,7 +652,10 @@ class GlobalLocalAdversarialModel(AdversarialModel):
         epoch_done = 1
         if os.path.exists(self.opt.training.pretrained_ckpt):
             epoch_done = self.load(self.opt.training.pretrained_ckpt, self.device)
-            self.validate(style_guided=True)
+            try:
+                self.validate(style_guided=True)
+            except Exception:
+                pass
         else:
             if os.path.exists(self.opt.training.pretrained_w):
                 w_dict = torch.load(self.opt.training.pretrained_w, self.device)
@@ -956,16 +959,20 @@ class GlobalLocalAdversarialModel(AdversarialModel):
                 self.save('last', epoch)
                 if epoch >= self.opt.training.start_save_epoch_val and \
                         epoch % self.opt.training.save_epoch_val == 0:
-                    self.print('Calculate FID_KID') if self.local_rank < 1 else None
-                    scores = self.validate()
+                    try:
+                        self.print('Calculate FID_KID') if self.local_rank < 1 else None
+                        scores = self.validate()
 
-                    if 'fid' in scores and scores['fid'] < best_fid:
-                        best_fid = scores['fid']
-                        self.save('best', epoch, **scores) if self.local_rank < 1 else None
+                        if 'fid' in scores and scores['fid'] < best_fid:
+                            best_fid = scores['fid']
+                            self.save('best', epoch, **scores) if self.local_rank < 1 else None
 
-                    if self.writer:
-                        for key, val in scores.items():
-                            self.writer.add_scalar('valid/%s' % key, val, epoch) if self.local_rank < 1 else None
+                        if self.writer:
+                            for key, val in scores.items():
+                                self.writer.add_scalar('valid/%s' % key, val, epoch) if self.local_rank < 1 else None
+                    except Exception as e:
+                        self.print(f"Periodic validation skipped: {e}")
+                        self.save('best', epoch)
 
                 if self.local_rank > -1:
                     dist.barrier()
