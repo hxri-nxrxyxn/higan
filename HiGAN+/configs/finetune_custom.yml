@@ -1,0 +1,130 @@
+device: 'cuda:0'
+model: 'gl_adversarial_model'
+dataset: 'custom'
+seed: 123456
+img_height: 64
+char_width: 32
+
+training:
+  dset_split: '../data/my_handwriting/'
+  epochs: 50
+  batch_size: 4
+  eval_batch_size: 4
+  lr: 0.0001
+  adam_b1: 0.5
+  adam_b2: 0.999
+  sample_iter_val: 50
+  print_iter_val: 10
+  start_save_epoch_val: 5
+  save_epoch_val: 5
+  ckpt_dir: 'ckpts'
+  lexicon: './data/english_words.txt'
+  max_word_len: 20
+  n_class: 80
+  capitalize_ratio: 0.5
+  blank_ratio: 0.
+  sort_input: true
+  vae_mode: true
+  lambda_kl: 0.0001
+  lambda_ctx: 2.0
+  lambda_gram: 2.0
+  pretrained_w: './pretrained/wid_iam_new.pth'
+  pretrained_r: './pretrained/ocr_iam_new.pth'
+  pretrained_ckpt: ''
+
+valid:
+  dset_name: 'custom'
+  dset_split: '../data/my_handwriting/'
+  batch_size: 4
+
+test:
+  interp_num: 7
+  nrow: 4
+
+# network configuration
+GenModel:
+  G_ch: 64
+  style_dim: 32
+  bottom_width: 4
+  bottom_height: 4
+  resolution: 64
+  G_kernel_size: 3
+  G_attn: '0'
+  n_class: 80
+  embed_dim: 120
+  embed_pad_idx: 0
+  embed_max_norm: 1.0
+  num_G_SVs: 1
+  num_G_SV_itrs: 1
+  cross_replica: false
+  mybn: false
+  BN_eps: 1.e-05
+  SN_eps: 1.e-08
+  init: 'N02'
+  G_param: 'SN'
+  norm_style: 'bn'
+  bn_linear: 'SN'
+  input_nc: 1
+
+DiscModel:
+  D_ch: 64
+  D_wide: true
+  resolution: 64
+  D_kernel_size: 3
+  D_attn: '0'
+  n_class: 80
+  num_D_SVs: 1
+  num_D_SV_itrs: 1
+  SN_eps: 1.e-08
+  output_dim: 1
+  init: 'N02'
+  D_param: 'SN'
+  bn_linear: 'SN'
+  input_nc: 1
+  one_hot: true
+
+PatchDiscModel:
+  D_ch: 64
+  D_wide: true
+  resolution: 32
+  D_kernel_size: 3
+  D_attn: '0'
+  n_class: 80
+  num_D_SVs: 1
+  num_D_SV_itrs: 1
+  SN_eps: 1.e-08
+  output_dim: 1
+  init: 'N02'
+  D_param: 'SN'
+  bn_linear: 'SN'
+  input_nc: 1
+  one_hot: true
+
+OcrModel:
+  resolution: 16
+  max_dim: 256
+  in_channel: 1
+  norm: 'bn'
+  init: 'none'
+  dropout: 0.
+  n_class: 80
+  rnn_depth: 2
+  bidirectional: true
+
+StyBackbone:
+  resolution: 16
+  max_dim: 256
+  in_channel: 1
+  init: 'N02'
+  dropout: 0.0
+  norm: 'bn'
+
+EncModel:
+  style_dim: 32
+  in_dim: 256
+  init: 'none'
+
+WidModel:
+  n_writer: 372
+  in_dim: 256
+  init: 'none'
